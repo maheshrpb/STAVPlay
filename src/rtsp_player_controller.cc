@@ -137,8 +137,8 @@ void RTSPPlayerController::UpdateAudioConfig() {
 		audio_config_.codec_type = Samsung::NaClPlayer::AUDIOCODEC_TYPE_AAC;
 		audio_config_.codec_profile = ConvertAACAudioCodecProfile(s->codecpar->profile);// Method
 		audio_config_.channel_layout =  ConvertChannelLayout(s->codecpar->channel_layout, s->codecpar->channels); //Method
-		audio_config_.sample_format = ConvertSampleFormat((AVSampleFormat)s->codecpar->format);
-		audio_config_.bits_per_channel = s->codecpar->bits_per_raw_sample / s->codecpar->channels;
+		audio_config_.sample_format = ConvertSampleFormat(s->codec->sample_fmt);
+		audio_config_.bits_per_channel = av_get_bytes_per_sample(s->codec->sample_fmt) * 8 / s->codecpar->channels; // bitrate divided by sample rate
 		audio_config_.samples_per_second = s->codecpar->sample_rate ;
 	}
 	else{
@@ -147,8 +147,8 @@ void RTSPPlayerController::UpdateAudioConfig() {
 		audio_config_.codec_profile = Samsung::NaClPlayer::AUDIOCODEC_PROFILE_AAC_LOW;
 		audio_config_.channel_layout = Samsung::NaClPlayer::CHANNEL_LAYOUT_MONO;
 		audio_config_.sample_format = Samsung::NaClPlayer::SAMPLEFORMAT_PLANARF32;
-		audio_config_.bits_per_channel = 16; // bitrate divided by sample rate
-		audio_config_.samples_per_second = s->codecpar->sample_rate;
+		audio_config_.bits_per_channel = 6; // bitrate divided by sample rate
+		audio_config_.samples_per_second = 8000;
 	}
 
 	LOG_INFO("audio configuration - codec: %d, profile: %d, sample_format: %d,"
@@ -163,32 +163,40 @@ void RTSPPlayerController::UpdateVideoConfig() {
 	AVStream* s = format_context_->streams[video_stream_idx_];
 
 	video_config_.codec_type = ConvertVideoCodec(s->codecpar->codec_id);
-	switch (video_config_.codec_type) {
-		case Samsung::NaClPlayer::VIDEOCODEC_TYPE_VP8:
-			video_config_.codec_profile =
-			    Samsung::NaClPlayer::VIDEOCODEC_PROFILE_VP8_MAIN;
-			break;
-		case Samsung::NaClPlayer::VIDEOCODEC_TYPE_VP9:
-			video_config_.codec_profile =
-			    Samsung::NaClPlayer::VIDEOCODEC_PROFILE_VP9_MAIN;
-			break;
-		case Samsung::NaClPlayer::VIDEOCODEC_TYPE_H264:
-			video_config_.codec_profile = ConvertH264VideoCodecProfile(s->codecpar->profile);
-			break;
-		case Samsung::NaClPlayer::VIDEOCODEC_TYPE_MPEG2:
-			video_config_.codec_profile = ConvertMPEG2VideoCodecProfile(s->codecpar->profile);
-			break;
-		default:
-			video_config_.codec_profile = Samsung::NaClPlayer::VIDEOCODEC_PROFILE_UNKNOWN;
+
+	if(1) {
+		video_config_.codec_profile = ConvertH264VideoCodecProfile(FF_PROFILE_H264_BASELINE);
+		video_config_.frame_format = ConvertVideoFrameFormat(AV_PIX_FMT_YUV420P);
+		video_config_.size = Size(1280, 720);
+	} else {
+
+		switch (video_config_.codec_type) {
+			case Samsung::NaClPlayer::VIDEOCODEC_TYPE_VP8:
+				video_config_.codec_profile =
+					Samsung::NaClPlayer::VIDEOCODEC_PROFILE_VP8_MAIN;
+				break;
+			case Samsung::NaClPlayer::VIDEOCODEC_TYPE_VP9:
+				video_config_.codec_profile =
+					Samsung::NaClPlayer::VIDEOCODEC_PROFILE_VP9_MAIN;
+				break;
+			case Samsung::NaClPlayer::VIDEOCODEC_TYPE_H264:
+				video_config_.codec_profile = ConvertH264VideoCodecProfile(s->codecpar->profile);
+				break;
+			case Samsung::NaClPlayer::VIDEOCODEC_TYPE_MPEG2:
+				video_config_.codec_profile = ConvertMPEG2VideoCodecProfile(s->codecpar->profile);
+				break;
+			default:
+				video_config_.codec_profile = Samsung::NaClPlayer::VIDEOCODEC_PROFILE_UNKNOWN;
+		}
+
+		video_config_.frame_format = ConvertVideoFrameFormat(s->codecpar->format);
+
+		AVDictionaryEntry* webm_alpha = av_dict_get(s->metadata, "alpha_mode", NULL, 0);
+		if (webm_alpha && !strcmp(webm_alpha->value, "1"))
+			video_config_.frame_format = Samsung::NaClPlayer::VIDEOFRAME_FORMAT_YV12A;
+
+		video_config_.size = Size(s->codecpar->width, s->codecpar->height);
 	}
-
-	video_config_.frame_format = ConvertVideoFrameFormat(s->codecpar->format);
-
-	AVDictionaryEntry* webm_alpha = av_dict_get(s->metadata, "alpha_mode", NULL, 0);
-	if (webm_alpha && !strcmp(webm_alpha->value, "1"))
-		video_config_.frame_format = Samsung::NaClPlayer::VIDEOFRAME_FORMAT_YV12A;
-
-	video_config_.size = Size(s->codecpar->width, s->codecpar->height);
 
 	LOG_INFO("r_frame_rate %d. %d#", s->r_frame_rate.num, s->r_frame_rate.den);
 	video_config_.frame_rate = Rational(s->r_frame_rate.num, s->r_frame_rate.den);
@@ -213,7 +221,7 @@ void RTSPPlayerController::InitializeStreams(int32_t, const std::string& url,
                                              const std::string& crt_path) {
 	// add ElementaryStreamListeners
 	std::shared_ptr<ESListener> video_listener = std::make_shared<ESListener>(this, kVideoType);
-	video_stream_ = std::make_shared<Samsung::NaClPlayer::VideoElementaryStream>();
+	video_stream_ = std::make_shared<Samsung::NaClPlayer::VideoElementaryStream>();	
 	int32_t err=data_source_->AddStream(*video_stream_, video_listener);
 	if (err == ErrorCodes::Success) {
 		LOG_INFO("Video added successfully");
@@ -416,17 +424,17 @@ void RTSPPlayerController::StartParsing(int32_t) {
 	AVCodecContext *in_codec_ctx = NULL, *out_codec_ctx = NULL;
 	SwrContext *resample_context = NULL;
 	AVAudioFifo *fifo = NULL;
-	AVStream* s = format_context_->streams[audio_stream_idx_];
 	int ret = 0, bits_this_sec = 0;
 	uint64_t stats_last_sent = 0;
 	RTSPState *state;
 	RTPDemuxContext *demux;
 
-	init_transcoder(s->codecpar, &in_codec_ctx, &out_codec_ctx, &resample_context);
-
+	if(audio_stream_idx_>=0){
+		AVStream* s = format_context_->streams[audio_stream_idx_];
+		init_transcoder(s->codecpar, &in_codec_ctx, &out_codec_ctx, &resample_context);
 	// Initialize the FIFO buffer to store audio samples to be encoded
-	init_fifo(&fifo, out_codec_ctx);
-
+		init_fifo(&fifo, out_codec_ctx);
+	}
 	AVPacket pkt;
 	av_init_packet(&pkt);
 	pkt.data = NULL;
@@ -473,7 +481,7 @@ void RTSPPlayerController::StartParsing(int32_t) {
 				if(is_transcode) {
 					es_pkt = MakeESPacketFromAVPacketTranscode(&pkt, fifo, in_codec_ctx, out_codec_ctx, resample_context);
 				} else {
-					es_pkt = MakeESPacketFromAVPacketDecode(&pkt,in_codec_ctx, is_mute_);
+					es_pkt = MakeESPacketFromAVPacketDecode(&pkt,in_codec_ctx);
 				}
 				//es_pkt = MakeESPacketFromAVPacket(&pkt);
 			} else {
@@ -494,15 +502,16 @@ void RTSPPlayerController::StartParsing(int32_t) {
 	}
 
 	LOG_INFO("Flushing decoder/encoder");
-	if (flush_decoder(in_codec_ctx) < 0)
-		LOG_ERROR("Could not flush decoder (error '%s')", get_error_text(ret));
+	if(audio_stream_idx_>=0){
+		if (flush_decoder(in_codec_ctx) < 0)
+			LOG_ERROR("Could not flush decoder (error '%s')", get_error_text(ret));
 
-	if (flush_encoder(out_codec_ctx) < 0)
-		LOG_ERROR("Could not flush encoder (error '%s')", get_error_text(ret));
+		if (flush_encoder(out_codec_ctx) < 0)
+			LOG_ERROR("Could not flush encoder (error '%s')", get_error_text(ret));
 
-	if (fifo)
-		av_audio_fifo_free(fifo);
-
+		if (fifo)
+			av_audio_fifo_free(fifo);
+	}
 	swr_free(&resample_context);
 	avcodec_free_context(&in_codec_ctx);
 	avcodec_free_context(&out_codec_ctx);
@@ -515,14 +524,16 @@ void RTSPPlayerController::StartParsing(int32_t) {
  * =================================================================
  * |bits per sample	| dB Max	| Base-ten Range					|
  * =================================================================
- * |	8			| 48.16		| -128 to +127
- * |	16			| 96.33		| -32,768 to +32,767
- * |	32			| 192.66	| -2,147,483,648 to +2,147,483,647
+ * |	8			| 48.16		| −128 to +127
+ * |	16			| 96.33		| −32,768 to +32,767
+ * |	32			| 192.66	| −2,147,483,648 to +2,147,483,647
  * ------------------------------------------------------------------
  */
+
 void RTSPPlayerController::calculateAudioLevel(AVFrame* input_frame, AVSampleFormat format, AVRational time_base) {
 	uint8_t *buff16 = *input_frame->extended_data;
 	int nb_samples = input_frame->nb_samples;
+	int bytes_per_sample = av_get_bytes_per_sample(format);
 	float sum = 0,decibel=0,sample;
 
 	if (audio_level_cb_frequency_ <= 0.0)  //user expects no audio-updates
@@ -559,8 +570,8 @@ void RTSPPlayerController::calculateAudioLevel(AVFrame* input_frame, AVSampleFor
 			sample = (float)(((int)buff16[(i*4) + 3] << 24) |((int)buff16[(i*4) + 2] << 16) | ((int)buff16[(i*4) + 1] << 8) | (int)buff16[i*4]);
 			sample = fabs(sample);
 			sum += sample;
-		}
-		break;
+		  }
+		  break;
 	  }
 
 	  default:
@@ -584,11 +595,11 @@ void RTSPPlayerController::calculateAudioLevel(AVFrame* input_frame, AVSampleFor
 
 }
 std::unique_ptr<ElementaryStreamPacket> RTSPPlayerController::MakeESPacketFromAVPacketDecode(
-    AVPacket* input_packet, AVCodecContext* in_codec_ctx, bool isMute) {
+    AVPacket* input_packet, AVCodecContext* in_codec_ctx) {
 	int ret = 0;
 	int data_present = 0;
 	AVFrame *input_frame = NULL;
-
+	uint8_t **converted_input_samples = NULL;
 	init_input_frame(&input_frame);
 	ret = decode(in_codec_ctx, input_frame, &data_present, input_packet);
 	if (ret < 0) {
@@ -598,9 +609,7 @@ std::unique_ptr<ElementaryStreamPacket> RTSPPlayerController::MakeESPacketFromAV
 	}
 	if (data_present) {
 		calculateAudioLevel(input_frame, in_codec_ctx->sample_fmt, in_codec_ctx->time_base);
-		if(!isMute) {
-			return MakeESPacketFromAVPacket(input_packet);
-		}
+		return MakeESPacketFromAVPacket(input_packet);
 	}
 	return NULL;
 }
@@ -611,21 +620,20 @@ std::unique_ptr<ElementaryStreamPacket> RTSPPlayerController::MakeESPacketFromAV
 	int ret = 0;
 	const int output_frame_size = out_codec_ctx->frame_size;
 
-		//Transcode any non AAC audio stream
-		int data_present = 0;
-		if (av_audio_fifo_size(fifo) < output_frame_size) {
-			// decode
-			AVFrame *input_frame = NULL;
-			uint8_t **converted_input_samples = NULL;
-			init_input_frame(&input_frame);
-
-			ret = decode(in_codec_ctx, input_frame, &data_present, input_packet);
-			if (ret < 0) {
-				LOG_ERROR("Could not decode frame (error '%s')", get_error_text(ret));
-				//av_packet_unref(&input_packet);
-				av_frame_free(&input_frame);
-				return NULL;
-			}
+	//Transcode any non AAC audio stream
+	int data_present = 0;
+	if (av_audio_fifo_size(fifo) < output_frame_size) {
+		// decode
+		AVFrame *input_frame = NULL;
+		uint8_t **converted_input_samples = NULL;
+		init_input_frame(&input_frame);
+		ret = decode(in_codec_ctx, input_frame, &data_present, input_packet);
+		if (ret < 0) {
+			LOG_ERROR("Could not decode frame (error '%s')", get_error_text(ret));
+			//av_packet_unref(&input_packet);
+			av_frame_free(&input_frame);
+			return NULL;
+		}
 		// If there is decoded data, convert and store it
 		if (data_present) {
 			calculateAudioLevel(input_frame, in_codec_ctx->sample_fmt, in_codec_ctx->time_base);
@@ -653,6 +661,7 @@ std::unique_ptr<ElementaryStreamPacket> RTSPPlayerController::MakeESPacketFromAV
 		// encode
 		// Temporary storage of the output samples of the frame written to the file
 		AVFrame *output_frame;
+
 		/**
 		 * Use the maximum number of possible samples per frame.
 		 * If there is less than the maximum possible frame size in the FIFO
